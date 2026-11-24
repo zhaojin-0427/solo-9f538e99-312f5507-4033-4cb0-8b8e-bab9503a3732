@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import db, sampling, service
 from .models import (
     AnomalyPage,
     Health,
@@ -20,6 +20,9 @@ from .models import (
     Overview,
     PriceIn,
     RehearsalWaybill,
+    SampleLineQuery,
+    SampleLineResult,
+    SampleVersionInfo,
     WaybillBatch,
     WeighIn,
     WriteResult,
@@ -45,7 +48,7 @@ app = FastAPI(
 
 
 def _translate(exc: Exception) -> HTTPException:
-    if isinstance(exc, service.NotFoundError):
+    if isinstance(exc, (service.NotFoundError, sampling.VersionNotFoundError)):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     if isinstance(exc, service.ConflictError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
@@ -220,6 +223,90 @@ def get_waybill(
             return service.rehearsal_detail(conn, waybill_no.strip())
         except service.NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+
+
+# --------------------------------------------------------------------------- #
+# 抽检版
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/samples/months/{departure_mon}/versions",
+    response_model=SampleVersionInfo,
+    status_code=status.HTTP_200_OK,
+    tags=["抽检版"],
+    summary="按发车月开抽检版：冻结同一已提交状态，返回版号与总行数",
+)
+def open_sample_version(
+    departure_mon: str,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    """开版事务内删旧版、冻结新版；失败回滚保留旧版，成功后只留新版。
+
+    开版期间来源写入串行等待，期间仍可补录/更正/撤回；开版完成后，
+    来源再怎么改动，本版行号都按冻结时的匹配解析。
+    """
+    try:
+        with db.immediate(conn):
+            return sampling.open_version(conn, departure_mon)
+    except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误，事务已回滚
+        raise _translate(exc)
+
+
+@app.get(
+    "/samples/months/{departure_mon}/versions/latest",
+    response_model=SampleVersionInfo,
+    tags=["抽检版"],
+    summary="查询某发车月当前有效的抽检版",
+)
+def get_latest_sample_version(
+    departure_mon: str,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    with db.snapshot(conn):
+        try:
+            return sampling.latest_version(conn, departure_mon)
+        except sampling.VersionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.get(
+    "/samples/versions/{version_id}",
+    response_model=SampleVersionInfo,
+    tags=["抽检版"],
+    summary="按版号查询抽检版信息",
+)
+def get_sample_version(
+    version_id: int,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    with db.snapshot(conn):
+        try:
+            return sampling.get_version_info(conn, version_id)
+        except sampling.VersionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
+
+@app.post(
+    "/samples/versions/{version_id}/lines",
+    response_model=SampleLineResult,
+    tags=["抽检版"],
+    summary="凭版号提交至多 20 个行号，返回运单号/过磅记录号/价目记录号",
+)
+def query_sample_lines(
+    version_id: int,
+    query: SampleLineQuery,
+    conn: sqlite3.Connection = Depends(db.get_connection),
+):
+    """行号按 (运单号, 过磅记录号, 价目记录号) 升序从 1 编号；越界 422。
+
+    只生成抽中的计费行；同一行号重复查询幂等，始终读开版冻结的匹配。
+    """
+    try:
+        with db.immediate(conn):
+            return sampling.resolve_lines(conn, version_id, query.line_nos)
+    except Exception as exc:  # noqa: BLE001 - 统一转 HTTP 错误，事务已回滚
+        raise _translate(exc)
 
 
 # --------------------------------------------------------------------------- #

@@ -127,3 +127,46 @@ class Health(BaseModel):
     status: Literal["ok"]
     version: int
     db_path: str
+
+
+# --------------------------------------------------------------------------- #
+# 抽检版
+# --------------------------------------------------------------------------- #
+
+
+class SampleLineQuery(BaseModel):
+    """凭版号提交待查行号：1..20 个、不可重复、必须为正整数。"""
+
+    line_nos: list[int] = Field(min_length=1, max_length=20)
+
+    @field_validator("line_nos")
+    @classmethod
+    def _positive_unique(cls, v: list[int]) -> list[int]:
+        if any(n < 1 for n in v):
+            raise ValueError("行号必须从 1 起算")
+        if len(set(v)) != len(v):
+            raise ValueError("同一请求内行号不可重复")
+        return v
+
+
+class SampleBillingLine(BaseModel):
+    line_no: int = Field(description="版内计费行号，从 1 起算")
+    waybill_no: str = Field(description="运单号")
+    weigh_record_no: str = Field(description="过磅记录号")
+    price_record_no: str = Field(description="价目记录号")
+
+
+class SampleLineResult(BaseModel):
+    version_id: int
+    total_rows: int
+    count: int
+    items: list[SampleBillingLine]
+
+
+class SampleVersionInfo(BaseModel):
+    version_id: int
+    departure_mon: str
+    total_rows: int = Field(description="开版时该月两次内连接的计费行总数")
+    source_version: int = Field(description="开版时冻结的已提交数据版本号")
+    status: Literal["active"]
+    created_at: str

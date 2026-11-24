@@ -139,6 +139,108 @@ CREATE INDEX IF NOT EXISTS idx_match_anomaly
     ON match_stats(is_anomaly, departure_mon, waybill_no);
 CREATE INDEX IF NOT EXISTS idx_match_month
     ON match_stats(departure_mon);
+
+-- ----------------------------------------------------------------------- --
+-- 抽检版子系统
+-- 开版在单个 BEGIN IMMEDIATE 事务内冻结同一已提交状态；之后来源怎么改、
+-- 服务是否重启，行号都按开版时的匹配解析。每月只保留一个 active 版。
+-- ----------------------------------------------------------------------- --
+
+-- 抽检版头
+CREATE TABLE IF NOT EXISTS sample_versions (
+    version_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    departure_mon  TEXT NOT NULL,
+    total_rows     INTEGER NOT NULL CHECK (total_rows >= 0),
+    source_version INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     TEXT NOT NULL
+);
+-- 每月至多一个 active 版（开版事务内先删旧再插新，失败回滚即保留旧版）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sample_versions_month_active
+    ON sample_versions(departure_mon) WHERE status = 'active';
+
+-- 冻结的每票命中统计；cum_rows = 按运单号升序累计到本票为止的计费行数
+CREATE TABLE IF NOT EXISTS sample_waybill_stats (
+    version_id INTEGER NOT NULL,
+    waybill_no TEXT NOT NULL,
+    train_no   TEXT NOT NULL,
+    origin     TEXT NOT NULL,
+    weigh_hits INTEGER NOT NULL,
+    price_hits INTEGER NOT NULL,
+    row_count  INTEGER NOT NULL,
+    cum_rows   INTEGER NOT NULL,
+    PRIMARY KEY (version_id, waybill_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+-- 行号 → 票：cum_rows 索引点查，每个行号只读 1 条票统计
+CREATE INDEX IF NOT EXISTS idx_sws_version_cum
+    ON sample_waybill_stats(version_id, cum_rows);
+
+-- 冻结来源记录：版内每条来源记录最多存一份（主键去重）
+CREATE TABLE IF NOT EXISTS sample_weigh_records (
+    version_id INTEGER NOT NULL,
+    record_no  TEXT NOT NULL,
+    train_no   TEXT NOT NULL,
+    weight_kg  REAL NOT NULL,
+    note       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (version_id, record_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_swr_version_train
+    ON sample_weigh_records(version_id, train_no, record_no);
+
+-- 冻结“开版当时实际命中”的成员关系：解析行号只走这张表，
+-- 不回源、不受来源后续更正（改车次/撤回）影响。
+CREATE TABLE IF NOT EXISTS sample_waybill_weigh (
+    version_id INTEGER NOT NULL,
+    waybill_no TEXT NOT NULL,
+    record_no  TEXT NOT NULL,
+    PRIMARY KEY (version_id, waybill_no, record_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_sww_version_waybill
+    ON sample_waybill_weigh(version_id, waybill_no, record_no);
+
+CREATE TABLE IF NOT EXISTS sample_price_records (
+    version_id  INTEGER NOT NULL,
+    record_no   TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    valid_from  TEXT NOT NULL,
+    valid_to    TEXT NOT NULL,
+    price_per_t REAL NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (version_id, record_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_spr_version_origin
+    ON sample_price_records(version_id, origin, record_no);
+
+CREATE TABLE IF NOT EXISTS sample_waybill_price (
+    version_id INTEGER NOT NULL,
+    waybill_no TEXT NOT NULL,
+    record_no  TEXT NOT NULL,
+    PRIMARY KEY (version_id, waybill_no, record_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_swp_version_waybill
+    ON sample_waybill_price(version_id, waybill_no, record_no);
+
+-- 只存抽中的计费行；同一版同一行号至多一份
+CREATE TABLE IF NOT EXISTS sampled_billing_lines (
+    version_id      INTEGER NOT NULL,
+    line_no         INTEGER NOT NULL,
+    waybill_no      TEXT NOT NULL,
+    weigh_record_no TEXT NOT NULL,
+    price_record_no TEXT NOT NULL,
+    PRIMARY KEY (version_id, line_no),
+    FOREIGN KEY (version_id) REFERENCES sample_versions(version_id)
+        ON DELETE CASCADE
+) WITHOUT ROWID;
 """
 
 
