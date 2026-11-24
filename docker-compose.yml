@@ -1,0 +1,15 @@
+services:
+  freight-rehearsal:
+    build: .
+    image: freight-rehearsal:latest
+    container_name: freight-rehearsal
+    ports:
+      - "8000:8000"
+    environment:
+      FREIGHT_DB_PATH: /data/freight.db
+    volumes:
+      - freight-data:/data
+    restart: unless-stopped
+
+volumes:
+  freight-data:
